@@ -10,6 +10,7 @@
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,9 @@
 #define MODE_FILE      0100644
 #define MODE_EXEC      0100755
 #define MODE_DIR       0040000
+
+// Forward declaration (implemented in object.c)
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
 // ─── PROVIDED ───────────────────────────────────────────────────────────────
 
@@ -129,9 +133,110 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //   - object_write    : save that binary buffer to the store as OBJ_TREE
 //
 // Returns 0 on success, -1 on error.
+typedef struct {
+    char names[MAX_TREE_ENTRIES][256];
+    int count;
+} DirSet;
+
+static int dirset_has(const DirSet *set, const char *name) {
+    for (int i = 0; i < set->count; i++) {
+        if (strcmp(set->names[i], name) == 0) return 1;
+    }
+    return 0;
+}
+
+static int tree_add_file_entry(Tree *tree, const IndexEntry *entry, const char *name) {
+    if (tree->count >= MAX_TREE_ENTRIES) return -1;
+    if (strlen(name) >= sizeof(tree->entries[tree->count].name)) return -1;
+
+    TreeEntry *out = &tree->entries[tree->count++];
+    out->mode = entry->mode;
+    out->hash = entry->hash;
+    snprintf(out->name, sizeof(out->name), "%s", name);
+    return 0;
+}
+
+static int tree_add_dir_entry(Tree *tree, const char *name, const ObjectID *id) {
+    if (tree->count >= MAX_TREE_ENTRIES) return -1;
+    if (strlen(name) >= sizeof(tree->entries[tree->count].name)) return -1;
+
+    TreeEntry *out = &tree->entries[tree->count++];
+    out->mode = MODE_DIR;
+    out->hash = *id;
+    snprintf(out->name, sizeof(out->name), "%s", name);
+    return 0;
+}
+
+static int write_tree_level(const Index *index, const char *prefix, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+
+    DirSet subdirs;
+    subdirs.count = 0;
+
+    size_t prefix_len = strlen(prefix);
+
+    for (int i = 0; i < index->count; i++) {
+        const char *path = index->entries[i].path;
+
+        if (prefix_len > 0) {
+            if (strncmp(path, prefix, prefix_len) != 0) continue;
+        }
+
+        const char *rest = path + prefix_len;
+        if (rest[0] == '\0') continue;
+
+        const char *slash = strchr(rest, '/');
+        if (!slash) {
+            if (tree_add_file_entry(&tree, &index->entries[i], rest) != 0) return -1;
+            continue;
+        }
+
+        size_t dir_len = (size_t)(slash - rest);
+        if (dir_len == 0 || dir_len >= 256) return -1;
+
+        char dirname[256];
+        memcpy(dirname, rest, dir_len);
+        dirname[dir_len] = '\0';
+
+        if (!dirset_has(&subdirs, dirname)) {
+            if (subdirs.count >= MAX_TREE_ENTRIES) return -1;
+            snprintf(subdirs.names[subdirs.count], sizeof(subdirs.names[subdirs.count]), "%s", dirname);
+            subdirs.count++;
+        }
+    }
+
+    for (int i = 0; i < subdirs.count; i++) {
+        const char *dirname = subdirs.names[i];
+
+        size_t child_prefix_len = prefix_len + strlen(dirname) + 2;
+        char *child_prefix = (char *)malloc(child_prefix_len);
+        if (!child_prefix) return -1;
+        snprintf(child_prefix, child_prefix_len, "%s%s/", prefix, dirname);
+
+        ObjectID subtree_id;
+        int rc = write_tree_level(index, child_prefix, &subtree_id);
+        free(child_prefix);
+        if (rc != 0) return -1;
+
+        if (tree_add_dir_entry(&tree, dirname, &subtree_id) != 0) return -1;
+    }
+
+    void *raw = NULL;
+    size_t raw_len = 0;
+    if (tree_serialize(&tree, &raw, &raw_len) != 0) return -1;
+
+    int rc = object_write(OBJ_TREE, raw, raw_len, id_out);
+    free(raw);
+    return rc;
+}
+
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    if (!id_out) return -1;
+
+    Index index;
+    if (index_load(&index) != 0) return -1;
+    if (index.count <= 0) return -1;
+
+    return write_tree_level(&index, "", id_out);
 }
