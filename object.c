@@ -346,7 +346,7 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
         return -1;
     }
 
-    void *out = malloc(actual_len > 0 ? actual_len : 1);
+    unsigned char *out = (unsigned char *)malloc(actual_len + 1);
     if (!out) {
         free(file_buf);
         return -1;
@@ -354,6 +354,7 @@ int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_
     if (actual_len > 0) {
         memcpy(out, file_buf + data_off, actual_len);
     }
+    out[actual_len] = '\0';
 
     free(file_buf);
     *type_out = parsed_type;
